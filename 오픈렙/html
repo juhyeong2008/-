@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>웹 아바타 & 표정 인식</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: #1a1a1a;
+      color: white;
+      font-family: sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    #container {
+      position: relative;
+      margin-top: 20px;
+    }
+    video, canvas {
+      border-radius: 12px;
+    }
+    canvas {
+      position: absolute;
+      left: 0;
+      top: 0;
+    }
+    #status-box {
+      margin-top: 15px;
+      padding: 10px 20px;
+      background: rgba(0,0,0,0.6);
+      border-radius: 8px;
+      font-size: 24px;
+      font-weight: bold;
+    }
+  </style>
+
+  <!-- MediaPipe Vision 라이브러리 로드 -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+  <h1>버추얼 표정 인식 테스트</h1>
+  <div id="status-box">표정 감지 중...</div>
+
+  <div id="container">
+    <!-- 웹캠 영상 (숨김 처리 가능) -->
+    <video id="webcam" autoplay playsinline width="640" height="480"></video>
+    <!-- 아바타 및 점을 그릴 캔버스 -->
+    <canvas id="output_canvas" width="640" height="480"></canvas>
+  </div>
+
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js";
+
+    const video = document.getElementById("webcam");
+    const canvasElement = document.getElementById("output_canvas");
+    const canvasCtx = canvasElement.getContext("2d");
+    const statusBox = document.getElementById("status-box");
+
+    let faceLandmarker;
+    let lastVideoTime = -1;
+
+    // 1. MediaPipe FaceLandmarker 초기화
+    async function initFaceLandmarker() {
+      const filesetResolver = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      );
+      faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+        baseOptions: {
+          modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+          delegate: "GPU"
+        },
+        outputFaceBlendshapes: true,
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+      startCamera();
+    }
+
+    // 2. 웹캠 시작
+    function startCamera() {
+      navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } }).then((stream) => {
+        video.srcObject = stream;
+        video.addEventListener("loadeddata", predictWebcam);
+      });
+    }
+
+    // 주요 특징점 인덱스 (MediaPipe Face Mesh 기준)
+    const INDICES = {
+      lips: [61, 291, 0, 17, 13, 14, 78, 308], // 입술 주변
+      eyebrows: [70, 63, 105, 66, 107, 336, 296, 334, 293, 300], // 눈썹
+      nose: [1, 2, 98, 327], // 코
+      head: [10, 152, 234, 454] // 머리/얼굴 윤곽 외곽
+    };
+
+    // 3. 실시간 감지 프레임 루프
+    async function predictWebcam() {
+      if (video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+        const results = faceLandmarker.detectForVideo(video, performance.now());
+
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+        if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+          const landmarks = results.faceLandmarks[0];
+
+          // (1) 주요 지점에 점 찍기
+          drawLandmarkPoints(landmarks);
+
+          // (2) 표정 조건 판단 (입꼬리, 눈썹)
+          const emotion = analyzeEmotion(landmarks);
+
+          // (3) 표정에 맞춰 간단한 아바타 마스크/오버레이 그리기
+          drawAvatarOverlay(landmarks, emotion);
+        }
+      }
+      requestAnimationFrame(predictWebcam);
+    }
+
+    // 주요 포인트 점 그리기 함수
+    function drawLandmarkPoints(landmarks) {
+      canvasCtx.fillStyle = "#00FF00"; // 기본 녹색 점
+
+      const allTargetIndices = [
+        ...INDICES.lips,
+        ...INDICES.eyebrows,
+        ...INDICES.nose,
+        ...INDICES.head
+      ];
+
+      allTargetIndices.forEach((index) => {
+        const point = landmarks[index];
+        const x = point.x * canvasElement.width;
+        const y = point.y * canvasElement.height;
+
+        canvasCtx.beginPath();
+        canvasCtx.arc(x, y, 3, 0, 2 * Math.PI);
+        canvasCtx.fill();
+      });
+    }
+
+    // 표정 분석 함수 (위치 임계값 기반)
+    function analyzeEmotion(landmarks) {
+      // 인덱스 기준:
+      // 61: 왼쪽 입꼬리, 291: 오른쪽 입꼬리, 0: 위입술 중앙, 17: 아래입술 중앙
+      // 1: 코 끝
+      // 105: 왼쪽 눈썹 상단, 334: 오른쪽 눈썹 상단, 159: 왼쪽 눈 상단
+      
+      const noseTip = landmarks[1];
+      const leftCorner = landmarks[61];
+      const rightCorner = landmarks[291];
+      const leftEyebrow = landmarks[105];
+      const leftEyeTop = landmarks[159];
+
+      // 얼굴 크기 기준 정규화를 위한 두 눈 사이/코 길이 측정
+      const faceHeight = Math.abs(landmarks[152].y - landmarks[10].y);
+
+      // 1. 입꼬리의 Y축 상대 위치 계산 (코끝 기준)
+      const avgCornerY = (leftCorner.y + rightCorner.y) / 2;
+      const mouthYDiff = (avgCornerY - noseTip.y) / faceHeight;
+
+      // 2. 눈썹과 눈 사이 거리 계산
+      const eyebrowDistance = (leftEyeTop.y - leftEyebrow.y) / faceHeight;
+
+      let emotion = "NORMAL 😐";
+
+      // 조건: 입꼬리가 오르면 Y좌표가 줄어듬 (화면 좌표계는 위가 0)
+      // 눈썹이 오르면 눈과 눈썹 사이 거리가 늘어남
+      if (mouthYDiff < 0.28) { 
+        emotion = "HAPPY 😀";
+      } else if (mouthYDiff > 0.35) {
+        emotion = "SAD 😭";
+      } else if (eyebrowDistance > 0.08) {
+        // 눈썹이 일정 이상 올라갈 때
+        emotion = "SURPRISED 😲";
+      }
+
+      statusBox.innerText = `현재 표정: ${emotion}`;
+      return emotion;
+    }
+
+    // 인식된 위치에 오버레이/아바타 요소 그리기
+    function drawAvatarOverlay(landmarks, emotion) {
+      const headTop = landmarks[10];
+      const x = headTop.x * canvasElement.width;
+      const y = headTop.y * canvasElement.height;
+
+      // 머리 위에 표정에 맞는 아바타 이모지/스티커 씌우기
+      canvasCtx.font = "60px sans-serif";
+      canvasCtx.textAlign = "center";
+
+      let avatarEmoji = "🐱"; // 기본 아바타
+      if (emotion.includes("HAPPY")) avatarEmoji = "😸";
+      if (emotion.includes("SAD")) avatarEmoji = "😿";
+      if (emotion.includes("SURPRISED")) avatarEmoji = "🙀";
+
+      canvasCtx.fillText(avatarEmoji, x, y - 20);
+    }
+
+    initFaceLandmarker();
+  </script>
+</body>
+</html>
